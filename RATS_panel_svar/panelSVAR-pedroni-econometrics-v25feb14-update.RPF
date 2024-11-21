@@ -1,0 +1,734 @@
+************************************************************************
+*                                                                      *
+*         RATS CODE FOR PANEL STRUCTURAL VAR ESTIMATION                *
+*                                                                      *
+*   Author: Peter Pedroni, Williams College, ppedroni@williams.edu     *
+*              http://econ.williams.edu/people/ppedroni                *                                        *
+*                                                                      *
+*            This version of code: 25 February, 2014                   *
+*           updated to include variance decompositions                 *                                   *
+*                                                                      *
+*                            REFERENCE:                                *
+*                                                                      *
+* Pedroni, Peter (2013) "Structural Panel VARs", Econometrics, 1 (2),  *
+* 180-206.                                                             *
+*                                                                      *
+*       Download: http://www.mdpi.com/journal/econometrics             *
+*                                                                      *
+* NOTE: For testing purposes, this code version is set up to read      *
+* the data file pedroni_ppp.xls, which is downloadable from estima.com.*
+* The identification scheme is nonsensical for this particular data,   *
+* and does not correspond to any existing study. It is up to the user  *
+* to supply his or her own data file and corresponding identification  *
+* scheme.                  *                                           *          *
+************************************************************************
+
+
+                ***  USER INPUT SECTION ***
+
+environment traperrors
+open data ../data/pedroni_ppp.xls   ;* name of data set
+data(format=xls,org=obs)    ;* arranged as one column of length N*T per variable
+close data                  ;* stacked as i=1,t=1...T, i=2,t=1,,,T, etc.
+environment notraperrors
+
+compute Nsecs = 20           ;* cross section dimension, N
+compute Tperiods = 246       ;* time series dimension, T
+                             ;* (see note below for unbalanced panels)
+compute m = 3                ;* number of variables in the SVAR
+compute maxlagsbar = 18      ;* maximum lags to be considered for common shock responses
+compute maxlagsctry = 18     ;* maximum lags to be considered for idiosyncratic shock respones
+
+compute nsteps = 24          ;* desired number of steps for the impulse responses
+
+compute averaging = 'median' ;* choose whether to report 'median' or 'mean' responses
+compute trimtol = 30.0       ;* option for trimming extreme outlier responses (set large to void)
+
+compute idoptions = 'longrun' ;* choose 'longrun' for recursive long run steady state response,
+                               ;* choose 'shortrun' for recursive short run impact matrix
+
+compute scaleby100 = 'no'     ;* choose 'yes' to represent responses as percentages, else 'no'
+
+set Ereal = ae*uscpi/cpi      ;* data transformations
+
+dec vec[series] datavec(m)
+dec vec[label] varlabels(m) shocklabels(m) idiolabels(2)
+
+set datavec(1) = log(Ereal)   ;* read variables in order of recursivity
+set datavec(2) = log(cpi)     ;* use similar command line for each variable read
+set datavec(3) = log(ae)      ;* delete command line if variable not used
+
+compute varlabels = ||'variable1','variable2','variable3'||  ;* desired labels for variables
+compute shocklabels = ||'e1','e2','e3'||                     ;* desired labels for shocks
+
+open plot panel-svar-graphs.rgf  ;* desired name for stored plots
+
+* USER INPUT SECTION NOTES:
+*
+* For unbalanced panels you should enter into your data set either blanks or the value
+* %NA for missing values, so that the end result is that each member has uniform length T,
+* and the data is stacked into a column of length N*T.
+*
+* Program will store individual member response and variance decomp estimates in excel files
+* with each row corresponding to a member, and will store plots for both in rgf graphics file.
+*
+*********************************************************************************
+   * (do not change anything below this line for standard run) *
+
+
+                   *** MAIN SOURCE CODE ***
+
+
+dec vect[series] z(m) dz(m) zbar(m) dzbar(m) barvec(m) tildevec(m) teffect(m) dteffect(m) tNcount(m)
+dec rect[series] Acumglobal(m,m)
+dec vect AICvec
+
+calendar(panelobs=Tperiods)
+do K=1,m
+  panel(entry=1.0,time=-1.0) datavec(K) 1 Tperiods*Nsecs tildevec(K)
+  panel(time=1.0,compress) datavec(K) 1 Tperiods*Nsecs teffect(K)
+  diff teffect(k) / dteffect(k)
+  set barvec(K) = datavec(K) - tildevec(K)
+  panel(tcount=1.0,compress) datavec(k) 1 Tperiods*Nsecs tNcount(k)
+end do K
+calendar
+
+@varlagselect(noprint,crit=gtos,lags=maxlagsbar)
+# dteffect
+compute chosenlag = %%autop
+if %%autop == 0
+{
+compute chosenlag = 1
+}
+end if
+
+
+system(model=globalteffect)
+vars dteffect
+lags 1 to chosenlag
+deterministics constant
+end(system)
+estimate(noftest,noprint,residuals=teffectmu,coeffs=teffectcoeff,outsigma=teffectsigma)
+
+
+compute A1 = %decomp(inv(%varlagsums)*teffectsigma*tr(inv(%varlagsums)))
+compute A0 = %varlagsums*A1
+
+**** if A0(1,2)<0.0 ; {; compute A0=A0*%diag(||1.0,-1.0||) ;} ;* end if
+**** place similar sign flipping for A1 matrix directly below A1 line if desired
+
+if idoptions == 'shortrun'
+{
+compute A0 = %decomp(teffectsigma)
+}
+end if
+
+dec vec temp1(m) temp2(m)
+dec vec[series] teffecteps(m) indctryeps(m)
+do s=1,Tperiods
+do k=1,m
+ewise temp1(k) = teffectmu(k)(s)
+end do k
+compute temp2 = inv(A0)*temp1
+do k=1,m ; set teffecteps(k) s s = temp2(k) ; end do k
+end do s
+
+
+**********LOOP*****************
+
+dec rect lambda(m,m)
+do r=1,Nsecs
+display 'processing panel member' R ;* 'ctryname' ctrynames(r)
+
+ do K=1,M
+    set z(K) 1 Tperiods = datavec(K)(T+(R-1)*Tperiods)
+    diff z(K) 2 Tperiods dz(K)
+    set zbar(K) 1 Tperiods = barvec(K)(T+(R-1)*Tperiods)
+    diff zbar(K) 2 Tperiods dzbar(K)                     ;*  or obtain from dz directly?
+ end do K
+
+calendar(q) 1960:1
+*print 1 Tperiods dz
+
+/*
+**** use this if want to make ind member maxlag sample dependent ****
+linreg(noprint) dz(1)
+# dz(2)
+write %nobs
+compute maxlagsctry = %nobs/10 + 2
+write maxlagsctry
+*/
+
+@varlagselect(noprint,crit=gtos,lags=maxlagsctry)
+# dz
+compute chosenlag = %%autop
+display 'chosenlag is ' chosenlag
+if %%autop == 0 ; { ; compute chosenlag = 1 ; }
+
+
+system(model=indctry)
+vars dz
+lags 1 to chosenlag
+deterministics constant
+end(system)
+estimate(noftest,noprint,residuals=indctrymu,coeffs=indctrycoeff,outsigma=indctrysigma)
+
+compute A1 = %decomp(inv(%varlagsums)*indctrysigma*tr(inv(%varlagsums)))
+compute A0 = %varlagsums*A1
+
+**** if A0(1,2)<0.0 ; {; compute A0=A0*%diag(||1.0,-1.0||) ;} ;* end if
+**** place similar sign flipping for A1 matrix directly below A1 line if desired
+
+if idoptions == 'shortrun'
+{
+compute A0 = %decomp(indctrysigma)
+}
+
+do s=1,Tperiods
+do k=1,m
+ewise temp1(k) = indctrymu(k)(s)
+end do k
+compute temp2 = inv(A0)*temp1
+do k=1,m ; set indctryeps(k) s s = temp2(k) ; end do k
+end do s
+
+
+dec vect[series] lambdaseries(m)
+compute lambda = %identity(m)
+compute lambdatilde = %identity(m)
+do k=1,m
+vcv(matrix=epscov,noprint) 1 Tperiods
+# indctryeps(k) teffecteps(k)
+*write espcov
+compute lambda(k,k) = epscov(1,2)
+compute lambdatilde(k,k) = sqrt(1.0-(epscov(1,2))**2)  ;* <----------
+set lambdaseries(k) r r = epscov(1,2)
+end do k
+
+impulses(model=indctry,noprint,results=Aindctry,decomp=A0,steps=nsteps)
+
+
+dec rect tempA(m,m) tempAbar(m,m) tempAtilde(m,m)
+dec rect[series] Abar(m,m) Atilde(m,m) Abarcum(m,m) Atildecum(m,m) Acomp(m,m) Acompcum(m,m)
+do s=1,nsteps
+ewise tempA(i,j) = Aindctry(i,j)(s)
+compute tempAbar = tempA*lambda   ;* <------------------------------
+compute tempAtilde = tempA*lambdatilde  ;* <---------------
+do i=1,m ; do j=1,m
+set Abar(i,j) s s = tempAbar(i,j)
+set Atilde(i,j) s s = tempAtilde(i,j)
+set Acomp(i,j) s s = tempA(i,j)
+end do j; end do i
+end do s
+
+do i=1,m ; do j=1,m
+accum Abar(i,j) 1 nsteps Abarcum(i,j)
+accum Atilde(i,j) 1 nsteps Atildecum(i,j)
+accum Acomp(i,j) 1 nsteps Acompcum(i,j)
+end do j; end do i
+
+
+dec rect[series] IRstoremat(nsteps,2*m**2)
+do s=1,nsteps
+compute count = 0
+do i=1,m
+do j=1,m
+compute count = count+1
+set IRstoremat(s,count) R R = Abarcum(i,j)(s)   ;* double check which is common v idio
+if abs(Acompcum(1,2)(nsteps)) > trimtol ;******** <-----------
+{
+set IRstoremat(s,count) R R = %NA ;* Aindctry(i,j)(s)
+}
+
+*display count ', ' i ', '  ', ' j
+compute count = count+1
+set IRstoremat(s,count) R R = Atildecum(i,j)(s)
+
+if abs(Acompcum(1,2)(nsteps)) > trimtol ;******** <-----------
+{
+set IRstoremat(s,count) R R = %NA ;* Aindctry(i,j)(s)
+}
+*display count ', ' i ', '  ', ' j
+end do j
+end do i
+end do s
+
+
+******VARIANCE DECOMPS********
+
+dec vect[series] denvec(m) sumdenvec(m)
+dec rect[series] nummat(m,m) sumnum(m,m) vdmat(m,m) workmat(m,m) $
+                 compVD(m,m) barVD(m,m) tildeVD(m,m) barVDfull(m,m) tildeVDfull(m,m)
+
+compute count = 0
+
+dofor workmat = Acompcum Abarcum atildecum
+compute count = count + 1
+
+do i=1,m ; do j=1,m
+*set nummat(i,j) 1 nsteps = Acompcum(i,j)**2
+set nummat(i,j) 1 nsteps = workmat(i,j)**2
+accum nummat(i,j) 1 nsteps sumnum(i,j)
+end do i; end do j
+
+do i=1,m
+set denvec(i) 1 nsteps = 0.0
+do j=1,m
+set denvec(i) 1 nsteps = denvec(i) + nummat(i,j)
+end do j
+accum denvec(i) 1 nsteps sumdenvec(i)
+end do i
+
+do i=1,m ; do j=1,m
+set vdmat(i,j) 1 nsteps = sumnum(i,j)/sumdenvec(i)
+end do j; end do i
+
+if count == 1
+{
+do i=1,m ; do j=1,m
+set compVD(i,j) = vdmat(i,j)
+end do i; end do j
+}
+
+if count == 2
+{
+do i=1,m ; do j=1,m
+set barVD(i,j) = vdmat(i,j)
+end do i; end do j
+}
+
+if count == 3
+{
+do i=1,m ; do j=1,m
+set tildeVD(i,j) = vdmat(i,j)
+end do i; end do j
+}
+
+end dofor workmat
+
+
+compute count = 0
+dofor workmat = Abarcum atildecum
+compute count = count + 1
+
+do i=1,m ; do j=1,m
+set nummat(i,j) 1 nsteps = workmat(i,j)**2
+accum nummat(i,j) 1 nsteps sumnum(i,j)
+end do i; end do j
+
+do i=1,m
+set denvec(i) 1 nsteps = 0.0
+do j=1,m
+set denvec(i) 1 nsteps = denvec(i) + Atildecum(i,j)**2 + Abarcum(i,j)**2
+end do j
+accum denvec(i) 1 nsteps sumdenvec(i)
+end do i
+
+do i=1,m ; do j=1,m
+set vdmat(i,j) 1 nsteps = sumnum(i,j)/sumdenvec(i)
+end do j; end do i
+
+if count == 1
+{
+do i=1,m ; do j=1,m
+set barVDfull(i,j) = vdmat(i,j)
+end do i; end do j
+}
+
+if count == 2
+{
+do i=1,m ; do j=1,m
+set tildeVDfull(i,j) = vdmat(i,j)
+end do i; end do j
+}
+
+end dofor workmat
+
+*set vdtest1 1 nsteps = barVDfull(1,1) + barVDfull(1,2) + tildeVDfull(1,1) + tildeVDfull(1,2)
+*set vdtest2 1 nsteps = barVDfull(2,1) + barVDfull(2,2) + tildeVDfull(2,1) + tildeVDfull(2,2)
+*print 1 nsteps vdtest1 vdtest2
+*print 1 nsteps barVDfull
+*print 1 nsteps tildeVDfull
+
+
+*********
+
+
+dec rect[series] Acompstore(nsteps,m**2) Atildestore(nsteps,m**2) Abarstore(nsteps,m**2) $
+                 compvdstore(nsteps,m**2) barvdstore(nsteps,m**2) tildevdstore(nsteps,m**2) $
+                 barvdfullstore(nsteps,m**2) tildevdfullstore(nsteps,m**2)
+
+
+do s=1,nsteps
+compute count = 0
+do j=1,m
+do i=1,m
+compute count = count+1
+
+set Acompstore(s,count) R R = Acompcum(i,j)(s) ;* Aindctry(i,j)(s)
+set Abarstore(s,count) R R = Abarcum(i,j)(s)
+set Atildestore(s,count) R R = Atildecum(i,j)(s)
+
+set compVDstore(s,count) R R = compVD(i,j)(s)
+set barVDstore(s,count) R R = barVD(i,j)(s)
+set tildeVDstore(s,count) R R = tildeVD(i,j)(s)
+
+set barVDfullstore(s,count) R R = barVDfull(i,j)(s)
+set tildeVDfullstore(s,count) R R = tildeVDfull(i,j)(s)
+
+
+if abs(Acompcum(1,2)(nsteps)) > trimtol ;******** <-----------
+{
+set Acompstore(s,count) R R = %NA
+set Abarstore(s,count) R R = %NA
+set Atildestore(s,count) R R = %NA
+set compVDstore(s,count) R R = %NA
+set barVDstore(s,count) R R = %NA
+set tildeVDstore(s,count) R R = %NA
+set barVDfullstore(s,count) R R = %NA
+set tildeVDfullstore(s,count) R R = %NA
+}
+
+end do i
+end do j
+end do s
+
+end do r
+
+**************** END R LOOP ****************
+
+
+dec rect Acompmeanmat(nsteps,m**2) Acompf25mat(nsteps,m**2) Acompf75mat(nsteps,m**2)
+dec vect[series] AcompIRmean(m**2) AcompIRf25(m**2) AcompIRf75(m**2)
+dec rect Abarmeanmat(nsteps,m**2) Abarf25mat(nsteps,m**2) Abarf75mat(nsteps,m**2)
+dec vect[series] AbarIRmean(m**2) AbarIRf25(m**2) AbarIRf75(m**2)
+dec rect Atildemeanmat(nsteps,m**2) Atildef25mat(nsteps,m**2) Atildef75mat(nsteps,m**2)
+dec vect[series] AtildeIRmean(m**2) AtildeIRf25(m**2) AtildeIRf75(m**2)
+
+dec rect VDcompmeanmat(nsteps,m**2) VDcompf25mat(nsteps,m**2) VDcompf75mat(nsteps,m**2)
+dec vect[series] VDcompIRmean(m**2) VDcompIRf25(m**2) VDcompIRf75(m**2)
+dec rect VDbarmeanmat(nsteps,m**2) VDbarf25mat(nsteps,m**2) VDbarf75mat(nsteps,m**2)
+dec vect[series] VDbarIRmean(m**2) VDbarIRf25(m**2) VDbarIRf75(m**2)
+dec rect VDtildemeanmat(nsteps,m**2) VDtildef25mat(nsteps,m**2) VDtildef75mat(nsteps,m**2)
+dec vect[series] VDtildeIRmean(m**2) VDtildeIRf25(m**2) VDtildeIRf75(m**2)
+
+dec rect VDbarfullmeanmat(nsteps,m**2) VDbarfullf25mat(nsteps,m**2) VDbarfullf75mat(nsteps,m**2)
+dec vect[series] VDbarfullIRmean(m**2) VDbarfullIRf25(m**2) VDbarfullIRf75(m**2)
+dec rect VDtildefullmeanmat(nsteps,m**2) VDtildefullf25mat(nsteps,m**2) VDtildefullf75mat(nsteps,m**2)
+dec vect[series] VDtildefullIRmean(m**2) VDtildefullIRf25(m**2) VDtildefullIRf75(m**2)
+
+
+do i=1,nsteps ; do j=1,m**2
+
+statistics(noprint,fractiles) Acompstore(i,j) 1 Nsecs
+compute Acompmeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute Acompmeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute Acompf25mat(i,j) = %fract25
+compute Acompf75mat(i,j) = %fract75
+
+statistics(noprint,fractiles) Abarstore(i,j) 1 Nsecs
+compute Abarmeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute Abarmeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute Abarf25mat(i,j) = %fract25
+compute Abarf75mat(i,j) = %fract75
+
+statistics(noprint,fractiles) Atildestore(i,j) 1 Nsecs
+compute Atildemeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute Atildemeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute Atildef25mat(i,j) = %fract25
+compute Atildef75mat(i,j) = %fract75
+
+
+statistics(noprint,fractiles) compVDstore(i,j) 1 Nsecs
+compute VDcompmeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute VDcompmeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute VDcompf25mat(i,j) = %fract25
+compute VDcompf75mat(i,j) = %fract75
+
+statistics(noprint,fractiles) barVDstore(i,j) 1 Nsecs
+compute VDbarmeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute VDbarmeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute VDbarf25mat(i,j) = %fract25
+compute VDbarf75mat(i,j) = %fract75
+
+statistics(noprint,fractiles) tildeVDstore(i,j) 1 Nsecs
+compute VDtildemeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute VDtildemeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute VDtildef25mat(i,j) = %fract25
+compute VDtildef75mat(i,j) = %fract75
+
+statistics(noprint,fractiles) barVDfullstore(i,j) 1 Nsecs
+compute VDbarfullmeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute VDbarfullmeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute VDbarfullf25mat(i,j) = %fract25
+compute VDbarfullf75mat(i,j) = %fract75
+
+statistics(noprint,fractiles) tildeVDfullstore(i,j) 1 Nsecs
+compute VDtildefullmeanmat(i,j) = %mean
+if averaging == 'median'
+{
+compute VDtildefullmeanmat(i,j) = %median ;* %mean ;* display %mean
+}
+compute VDtildefullf25mat(i,j) = %fract25
+compute VDtildefullf75mat(i,j) = %fract75
+
+end do j ; end do i
+
+
+
+do i=1,nsteps ; do j=1,m**2
+
+set AcompIRmean(j) i i  = Acompmeanmat(i,j)
+set AcompIRf25(j) i i  = Acompf25mat(i,j)
+set AcompIRf75(j) i i  = Acompf75mat(i,j)
+
+set AbarIRmean(j) i i  = Abarmeanmat(i,j)
+set AbarIRf25(j) i i  = Abarf25mat(i,j)
+set AbarIRf75(j) i i  = Abarf75mat(i,j)
+
+set AtildeIRmean(j) i i  = Atildemeanmat(i,j)
+set AtildeIRf25(j) i i  = Atildef25mat(i,j)
+set AtildeIRf75(j) i i  = Atildef75mat(i,j)
+
+
+set VDcompIRmean(j) i i  = VDcompmeanmat(i,j)
+set VDcompIRf25(j) i i  = VDcompf25mat(i,j)
+set VDcompIRf75(j) i i  = VDcompf75mat(i,j)
+
+set VDbarIRmean(j) i i  = VDbarmeanmat(i,j)
+set VDbarIRf25(j) i i  = VDbarf25mat(i,j)
+set VDbarIRf75(j) i i  = VDbarf75mat(i,j)
+
+set VDtildeIRmean(j) i i  = VDtildemeanmat(i,j)
+set VDtildeIRf25(j) i i  = VDtildef25mat(i,j)
+set VDtildeIRf75(j) i i  = VDtildef75mat(i,j)
+
+
+set VDbarfullIRmean(j) i i  = VDbarfullmeanmat(i,j)
+set VDbarfullIRf25(j) i i  = VDbarfullf25mat(i,j)
+set VDbarfullIRf75(j) i i  = VDbarfullf75mat(i,j)
+
+set VDtildefullIRmean(j) i i  = VDtildefullmeanmat(i,j)
+set VDtildefullIRf25(j) i i  = VDtildefullf25mat(i,j)
+set VDtildefullIRf75(j) i i  = VDtildefullf75mat(i,j)
+
+end do j ; end do i
+
+
+
+calendar
+dec vec[string] figlabels(3)
+compute figlabels(1) = 'median'
+compute figlabels(2) = '25 percentile'
+compute figlabels(3) = '75 percentile'
+
+
+declare rect[string] compgraphtitle(m,m) bargraphtitle(m,m) tildegraphtitle(m,m)
+do i=1,m; do j=1,m
+compute compgraphtitle(i,j) = 'response of '+ varlabels(i) + ' to composite '+ shocklabels(j) + ' shocks'
+compute bargraphtitle(i,j) = 'response of '+ varlabels(i) + ' to common '+ shocklabels(j) + ' shocks'
+compute tildegraphtitle(i,j) = 'response of '+ varlabels(i) + ' to idiosyncratic '+ shocklabels(j) + ' shocks'
+end do j; end do i
+
+
+if scaleby100 == 'yes'
+{
+*print 1 11 AtildeIRmean
+declare vect[series] workvect(m**2)
+dofor workvect = AtildeIRmean AtildeIRf25 AtildeIRf75 AbarIRmean AbarIRf25 AbarIRf75
+do count=1,m**2
+set workvect(count) 1 nsteps = workvect(count)*100.0
+*print 1 11 workvect(count)
+end do count
+end dofor workvect
+}
+end if
+
+
+spgraph(vfields=m*2,hfields=m,header='Figure 1.',subheader='Impulse Responses from the Panel SVAR')
+
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=tildegraphtitle(i,j)) 3
+# AtildeIRmean(count) 1 nsteps
+# AtildeIRf25(count) 1 nsteps
+# AtildeIRf75(count) 1 nsteps
+
+graph(key=below,klabel=figlabels,header=bargraphtitle(i,j)) 3
+# AbarIRmean(count) 1 nsteps
+# AbarIRf25(count) 1 nsteps
+# AbarIRf75(count) 1 nsteps
+
+end do i; end do j
+
+spgraph(done)
+
+
+spgraph(vfields=m*2,hfields=m,header='Figure 2.',subheader='Variance Decompositions as Shares of Variations due to Composite Shocks')
+
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=tildegraphtitle(i,j)) 3
+# VDtildefullIRmean(count) 1 nsteps
+# VDtildefullIRf25(count) 1 nsteps
+# VDtildefullIRf75(count) 1 nsteps
+
+graph(key=below,klabel=figlabels,header=bargraphtitle(i,j)) 3
+# VDbarfullIRmean(count) 1 nsteps
+# VDbarfullIRf25(count) 1 nsteps
+# VDbarfullIRf75(count) 1 nsteps
+
+end do i; end do j
+
+spgraph(done)
+
+
+spgraph(vfields=m,hfields=m,header='Figure 3.',subheader='Response Estimates to Composite Shocks')
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=compgraphtitle(i,j)) 3
+# AcompIRmean(count) 1 nsteps
+# AcompIRf25(count) 1 nsteps
+# AcompIRf75(count) 1 nsteps
+end do i; end do j
+spgraph(done)
+
+
+spgraph(vfields=m,hfields=m,header='Figure 4.',subheader='Response Estimates to Common Shocks')
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=bargraphtitle(i,j)) 3
+# AbarIRmean(count) 1 nsteps
+# AbarIRf25(count) 1 nsteps
+# AbarIRf75(count) 1 nsteps
+end do i; end do j
+spgraph(done)
+
+
+spgraph(vfields=m,hfields=m,header='Figure 5.',subheader='Response Estimates to Idiosyncratic Shocks')
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=tildegraphtitle(i,j)) 3
+# AtildeIRmean(count) 1 nsteps
+# AtildeIRf25(count) 1 nsteps
+# AtildeIRf75(count) 1 nsteps
+end do i; end do j
+spgraph(done)
+
+
+spgraph(vfields=m,hfields=m,header='Figure 6.',subheader='Variance Decompositons as Shares of Variations due to Composite Shocks')
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=compgraphtitle(i,j)) 3
+# VDcompIRmean(count) 1 nsteps
+# VDcompIRf25(count) 1 nsteps
+# VDcompIRf75(count) 1 nsteps
+end do i; end do j
+spgraph(done)
+
+
+spgraph(vfields=m,hfields=m,header='Figure 7.',subheader='Variance Decompositons as Shares of Variations due to Common Shocks Only ')
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=bargraphtitle(i,j)) 3
+# VDbarIRmean(count) 1 nsteps
+# VDbarIRf25(count) 1 nsteps
+# VDbarIRf75(count) 1 nsteps
+end do i; end do j
+spgraph(done)
+
+
+spgraph(vfields=m,hfields=m,header='Figure 8.',subheader='Variance Decompositons as Shares of Variations due to Idiosyncratic Shocks Only')
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+graph(key=below,klabel=figlabels,header=tildegraphtitle(i,j)) 3
+# VDtildeIRmean(count) 1 nsteps
+# VDtildeIRf25(count) 1 nsteps
+# VDtildeIRf75(count) 1 nsteps
+end do i; end do j
+spgraph(done)
+
+close plot
+
+
+set membernum 1 Nsecs = T
+labels membernum
+# ' Unit #'
+
+compute count = 0
+do j=1,m ; do i=1,m
+compute count = count + 1
+do s=1,nsteps
+labels Acompstore(s,count)
+# 'IR('+i+','+j+')_'+s
+labels Abarstore(s,count)
+# 'IR('+i+','+j+')_'+s
+labels Atildestore(s,count)
+# 'IR('+i+','+j+')_'+s
+labels tildeVDfullstore(s,count)
+# 'VD('+i+','+j+')_'+s
+labels barVDfullstore(s,count)
+# 'VD('+i+','+j+')_'+s
+end do s
+end do i; end do j
+
+open copy ind-IRs-to-composite-shocks.xls
+copy(format=xls,org=cols) 1 Nsecs membernum Acompstore
+close copy
+
+open copy ind-IRs-to-common-shocks.xls
+copy(format=xls,org=cols) 1 Nsecs membernum Abarstore
+close copy
+
+open copy ind-IRs-to-idiosyncratic-shocks.xls
+copy(format=xls,org=cols) 1 Nsecs membernum Atildestore
+close copy
+
+open copy ind-VDs-oftotal-to-idiosyncratic-shocks.xls
+copy(format=xls,org=cols) 1 Nsecs membernum tildeVDfullstore
+close copy
+
+open copy ind-VDs-oftotal-to-common-shocks.xls
+copy(format=xls,org=cols) 1 Nsecs membernum barVDfullstore
+close copy
+
+
+
+
+
+
+
+
+
+
+
+
